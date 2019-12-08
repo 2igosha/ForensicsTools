@@ -33,6 +33,10 @@ IF ( NOT (MINGW OR WIN32 ) )
 
 	SET(GNU_FLAGS "${GNU_FLAGS} -Wno-unused-function -Wno-deprecated-declarations -Wno-missing-noreturn -Wformat -Wno-variadic-macros -D__STDC_FORMAT_MACROS")
 
+	IF ( ( ${CMAKE_C_COMPILER_ID} STREQUAL "Clang" ) ) 
+		SET(GNU_FLAGS "-Wno-unknown-warning-option -Wno-address-of-packed-member -Wno-extended-offsetof  -Wno-ignored-attributes -Wno-unused-result  -pedantic -pedantic-errors -Werror -fno-jump-tables")
+	ENDIF()
+
 	SET(OPTIMIZE_FLAGS "   -fstack-protector -D_FORTIFY_SOURCE=2 ")
 	IF ( CMAKE_BUILD_TYPE STREQUAL "Release" )
 			SET(OPTIMIZE_FLAGS " ${OPTIMIZE_FLAGS} -O3 -msse4 -mfpmath=sse -fomit-frame-pointer")

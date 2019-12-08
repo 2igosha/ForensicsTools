@@ -1,5 +1,11 @@
-#ifndef win_types_h_included
-#define win_types_h_included
+#pragma once
+
+#if defined (_MSC_VER)
+#include <winsock2.h>
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 #define _CRT_SECURE_NO_WARNINGS	1
 #define _CRT_NONSTDC_NO_DEPRECATE 1
@@ -15,18 +21,19 @@
 
 #ifdef _WIN32
 
-#include <windows.h>
 #include <sys/types.h>
-// #include <stdint.h>
-#include <windef.h>
 
-#ifdef _MSC_VER
+#define poll WSAPoll
+
+#if defined (_MSC_VER) && (_MSC_VER < 1400 )
 typedef unsigned __int64 uint64_t;
 typedef __int64 int64_t;
 typedef signed int int32_t;
 typedef DWORD uint32_t;
 typedef WORD uint16_t;
 typedef BYTE uint8_t;
+#define asm __asm
+
 #else
 #include <stdint.h>
 #endif
@@ -41,12 +48,9 @@ typedef uint32_t in_addr_t;
 
 #define random rand
 #define strncasecmp _strnicmp
+#define strcasecmp _stricmp
 
-// #ifndef GCC_PACKED
-// #define GCC_PACKED
-// #endif
-
-#ifndef __MINGW64_VERSION_MAJOR
+#if !defined (__MINGW64_VERSION_MAJOR) && (!defined (_MSC_VER) || (_MSC_VER < 1800 ) )
 	#define snprintf _snprintf
 #endif
 
@@ -54,22 +58,25 @@ typedef uint32_t in_addr_t;
 
 #define sleep(x) Sleep(x*1000)
 
-EXTERN_C_BEGIN
-int getopt(int nargc, char * const nargv[],  const char* ostr);
-EXTERN_C_END
+#include "getopt.h"
 
 #if defined (_MSC_VER)
 
-#define asm __asm
+typedef SSIZE_T ssize_t;
+
 #define strdup _strdup
-/*#define open _open
-#define read _read
-#define close _close*/
+
+static struct tm* gmtime_r(const time_t* t, struct tm* result){
+	return ( gmtime_s(result, t) == 0 ? result : NULL );
+}
+
+#if !defined (_MSC_VER) || (_MSC_VER < 1800 )
+
 #define isnan _isnan
 
 #include <math.h>
 #include <float.h>
-
+                    
 static int isinf(double value)
 {
 	return !isnan(value) && isnan(value - value);
@@ -79,6 +86,7 @@ static int signbit(double value)
 {
 	return ( _copysign(1.0, value) < 0.0 ? 1 : 0 );
 }
+#endif
 
 #endif
 
@@ -130,6 +138,7 @@ typedef uint8_t  BYTE;
 #ifndef __MINGW64_VERSION_MAJOR
 #include <string.h>
 
+#if !defined(_MSC_VER) || (_MSC_VER < 1600 )
 static size_t
 strnlen(const char *s, size_t maxlen)
 {
@@ -147,4 +156,3 @@ strnlen(const char *s, size_t maxlen)
 #endif
 
 #endif
-

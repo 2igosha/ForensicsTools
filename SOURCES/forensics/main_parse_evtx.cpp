@@ -3,23 +3,30 @@
  *       Filename:  parse_evtx.cpp
  *    Description:  Parse EVTX format files
  *        Created:  09.01.2018 16:59:43
- *         Author:  Igor Soumenkov (igosha), igosha@kaspersky.com
+ *         Author:  Igor Kuznetsov (igosha)
+ *         igosha@kaspersky.com
+ *         2igosha@gmail.com
  * =====================================================================================
  */
 #include <stdlib.h>
 #include <stdio.h>
 #include <fcntl.h>
-#include <unistd.h>
 #include <stdint.h>
 #include <inttypes.h>
 #include <string.h>
 #include <time.h>
 #include <utils/win_types.h>
+#include <unordered_map>
+#include <vector>
+#include <map>
+#include <string>
 #include "eventlist.h"
 
 // #define PRINT_TAGS
 
 #include <tools/wintime.h>
+
+namespace {
 
 #pragma pack(push, 1)
 
@@ -82,260 +89,234 @@ typedef enum
 }
 XmlParseState;
 
-typedef struct sParseContext
-{
-	sParseContext*	chunkContext;
+struct TemplateDescription;
+
+struct ParseContext {
+	ParseContext*	chunkContext;
 	const uint8_t*	data;
 	size_t		dataLen;
 	size_t		offset;
 	size_t		offsetFromChunkStart;
 	XmlParseState	state;
-	unsigned int	currentTemplateIdx;
+	TemplateDescription* currentTemplatePtr;
 	char		cachedValue[256];
-}
-ParseContext;
 
-static bool	ParseBinXml(ParseContext* ctx, size_t inFileOffset);
-
-static bool	HaveEnoughData(ParseContext* ctx, size_t numBytes)
-{
-	return ( ctx->offset + numBytes <= ctx->dataLen );
-}
-
-static void	SkipBytes(ParseContext* ctx, size_t numBytes)
-{
-	ctx->offset += numBytes;
-}
-
-template<class c>
-static bool	ReadData(ParseContext* ctx, c* result, size_t count = 1)
-{
-	if ( !HaveEnoughData(ctx, sizeof(*result) * count) )
-		return false;
-	for (size_t idx = 0; idx < count; idx++)
-	{
-		result[idx] = *(c*)(ctx->data + ctx->offset);
-		ctx->offset += sizeof(*result);
+	bool	HaveEnoughData(size_t numBytes) const {
+		return ( offset + numBytes <= dataLen );
 	}
-	return true;
-}
 
-#define MAX_IDS			256
-#define MAX_NUM_ARGS		256
-#define INVALID_TEMPLATE_IDX	((unsigned int)-1)
+	void	SkipBytes(size_t numBytes) {
+		offset += numBytes;
+	}
 
-typedef struct sTemplateArgPair
-{
-	sTemplateArgPair*	next;
+	template<class c>
+	bool	ReadData(c* result, size_t count = 1)
+	{
+		if ( !HaveEnoughData(sizeof(*result) * count) )
+			return false;
+		for (size_t idx = 0; idx < count; idx++)
+		{
+			result[idx] = *(c*)(data + offset);
+			offset += sizeof(*result);
+		}
+		return true;
+	}
+
+	void InheritWithOffset(ParseContext* other, size_t wantedLen) {
+		data = other->data + other->offset;
+		dataLen = wantedLen;
+		if ( other->offset + dataLen > other->dataLen ) {
+			/*  invalid len specified, fix it */
+			if ( other->offset >= other->dataLen ) {
+				dataLen = 0; /* out of all bounds */
+			} else {
+				dataLen = other->dataLen - other->offset;
+#if defined(PRINT_TAGS)
+				printf("cap on wantedLen %08zX (%08zX), want %08zX, give %08zX\n", other->offset, other->offset, wantedLen, dataLen);
+#endif
+			}
+		}
+		offset = 0;
+		chunkContext = other;
+		offsetFromChunkStart = other->offset + other->offsetFromChunkStart;
+		cachedValue[0] = 0;
+	}
+
+	void UpdateLen(size_t wantedLen){
+		if ( wantedLen <= dataLen ) {
+			dataLen = wantedLen;
+		}
+	}
+};
+
+bool	ParseBinXml(ParseContext* ctx, size_t chunkOffsetInFile);
+
+struct TemplateArgPair {
+	TemplateArgPair(const TemplateArgPair&) = delete;
+	TemplateArgPair(TemplateArgPair&& other) {
+		key = other.key;
+		type = other.type;
+		other.key = nullptr;
+	}
+	TemplateArgPair(const char* ekey, uint16_t etype){
+		key = strdup(ekey);
+		type = etype;
+	}
+	~TemplateArgPair() {
+		if ( key ) {
+			free(key);
+		}
+	}
 	char*			key;
 	uint16_t		type;
-	uint16_t		argIdx;
-}
-TemplateArgPair;
+};
 
-typedef struct	sTemplateFixedPair
-{
-	sTemplateFixedPair*	next;
+struct TemplateFixedPair {
+	TemplateFixedPair(const TemplateFixedPair&) = delete;
+	TemplateFixedPair(TemplateFixedPair&& other){
+		key = other.key;
+		value = other.value;
+		other.key = nullptr;
+		other.value = nullptr;
+	}
+	TemplateFixedPair(const char* ekey, const char* evalue) {
+		key = strdup(ekey);
+		value = strdup(evalue);
+	}
+	~TemplateFixedPair() {
+		if ( key ) {
+			free(key);
+		}
+		if ( value ) {
+			free(value);
+		}
+	}
 	char*			key;
 	char*			value;
-}
-TemplateFixedPair;
+};
 
-typedef struct
-{
+struct TemplateDescription {
+	TemplateDescription() : shortID(0) {}
 	uint32_t		shortID;
-	TemplateFixedPair	fixedRoot;
-	TemplateArgPair		argsRoot;
-}
-TemplateDescription;
+	std::vector<TemplateFixedPair>		fixed;
+	std::unordered_map<uint16_t, TemplateArgPair>	args;
 
-template <class c>
-static void InitRoot(c* root)
-{
-	root->next = NULL;
-}
-
-template<class c>
-static c* AddPair(c* root)
-{
-	c*	item	=	(c*)malloc(sizeof(c));
-	if ( item != NULL )
-	{
-		item->next = root->next;
-		root->next = item;
-	}
-	return item;
-}
-
-static void	FreePair(TemplateFixedPair* item)
-{
-	free(item->key);
-	free(item->value);
-	free(item);
-}
-
-static void	FreePair(TemplateArgPair* item)
-{
-	free(item->key);
-	free(item);
-}
-
-template <class c>
-static void ResetRoot(c* root)
-{
-	c*	nextItem	=	NULL;
-
-	for (c* ptr = root->next; ptr != NULL; ptr = nextItem)
-	{
-		nextItem = ptr->next;
-		FreePair(ptr);
+	void	RegisterFixedPair(const char* key, const char* value) {
+		fixed.emplace_back(TemplateFixedPair(key, value));
 	}
 
-	root->next = NULL;
-}
+	void	RegisterArgPair(const char* key, uint16_t type, uint16_t argIdx) {
+		args.emplace(std::make_pair(argIdx, TemplateArgPair(key ? key : "", type)));
+	}
 
-static void InitTemplateDescription(TemplateDescription* item)
-{
-	InitRoot(&item->fixedRoot);
-	InitRoot(&item->argsRoot);
-	item->shortID = 0;
-}
+};
 
-static void ResetTemplateDescription(TemplateDescription* item)
-{
-	ResetRoot(&item->fixedRoot);
-	ResetRoot(&item->argsRoot);
-	item->shortID = 0;
-}
-
-static uint32_t			knownIDs[MAX_IDS] 	=	{ 0 };
-static TemplateDescription	templates[MAX_IDS];
-static unsigned int		numIDs			=	0;
+#define countof(arr) ( sizeof(arr) / sizeof(*arr) )
 
 #define MAX_NAME_STACK_DEPTH	20
 #define INVALID_STACK_DEPTH 	((ssize_t)-1)
 
-typedef struct
-{
+struct NameStackElement{
 	char	name[256];
-}
-NameStackElement;
+};
 
+// Current time 2 m 20 sec
+constexpr unsigned maxNameStackDepth = 20;
+class NameStack {
+public:
+	NameStack() : nameStack(maxNameStackDepth), nameStackPtr(INVALID_STACK_DEPTH) {}
 
-#define countof(arr) ( sizeof(arr) / sizeof(*arr) )
+	void Reset() {
+		nameStackPtr = INVALID_STACK_DEPTH;
+	}
 
-static void	InitTemplates(void)
-{
-	for (size_t idx = 0; idx < countof(templates); idx++)
-		InitTemplateDescription(&templates[idx]);
-}
+	void	PushName(const char* name) {
+		if ( nameStackPtr + 1 >= MAX_NAME_STACK_DEPTH )
+			return;
+		nameStackPtr++;
+		strncpy(nameStack[nameStackPtr].name, name, sizeof(nameStack[nameStackPtr].name));
+		nameStack[nameStackPtr].name[ sizeof(nameStack[nameStackPtr].name) - 1 ]  = 0;
+	}
 
-static ssize_t		nameStackPtr	=	INVALID_STACK_DEPTH;
-static NameStackElement	nameStack[MAX_NAME_STACK_DEPTH];
+	void	PopName(void) {
+		if ( nameStackPtr > INVALID_STACK_DEPTH )
+			nameStackPtr--;
+	}
 
-const char**	eventDescriptionHashTable	=	NULL;
+	const char* GetName() const {
+		if ( nameStackPtr <= INVALID_STACK_DEPTH || nameStackPtr >= MAX_NAME_STACK_DEPTH )
+			return NULL;
+		return nameStack[nameStackPtr].name;
+	}
+
+	const char* GetUpperName() const {
+		if ( nameStackPtr <= INVALID_STACK_DEPTH || nameStackPtr >= MAX_NAME_STACK_DEPTH )
+			return NULL;
+		if ( nameStackPtr < 1 )
+			return NULL;
+
+		return nameStack[nameStackPtr - 1].name;
+	}
+
+private:
+	std::vector<NameStackElement> nameStack;
+	ssize_t		nameStackPtr;
+};
+
+NameStack nameStack;
+
+class Templates {
+public:
+	// 2 m 29 sec with this map
+	bool	IsKnownID(uint32_t	id, TemplateDescription** result) {
+		auto it = knownIDs.find(id);
+		if ( it == knownIDs.end() ) {
+			return false;
+		}
+		*result = &it->second;
+		return true;
+	}
+
+	bool	RegisterID(uint32_t	id, TemplateDescription** result) {
+		knownIDs[id] = TemplateDescription{};
+		auto it = knownIDs.find(id);
+		if ( it == knownIDs.end() ) {
+			return false;
+		}
+		*result = &it->second;
+		return true;
+	}
+
+	void Reset() {
+		knownIDs.clear();
+	}
+
+private:
+	std::unordered_map<uint32_t,TemplateDescription>	knownIDs;
+};
+
+Templates ids;
+
+std::unordered_map<uint16_t, std::string> eventDescriptionHashTable;
 const char*	logonTypes[]	= { NULL, NULL, "Interactive", "Network", "Batch", "Service", NULL, "Unlock", "NetworkCleartext", "NewCredentials", "RemoteInteractive", "CachedInteractive"};
 
-static void	RegisterFixedPair(unsigned int templateIdx, const char* key, const char* value)
+void	ResetTemplates(void)
 {
-	TemplateFixedPair*	newPair	=	AddPair(&templates[templateIdx].fixedRoot);
-	if ( newPair == NULL )
-		return;
-	newPair->key = strdup(key);
-	newPair->value = strdup(value);
+	ids.Reset();
 }
 
-
-static void	RegisterArgPair(unsigned int templateIdx, const char* key, uint16_t type, uint16_t argIdx)
-{
-	TemplateArgPair*	newPair	=	AddPair(&templates[templateIdx].argsRoot);
-	if ( newPair == NULL )
-		return;
-	// broken record 3420028194 (security.evtx)
-	newPair->key = strdup(key == NULL ? "" : key);
-	newPair->type = type;
-	newPair->argIdx = argIdx;
-}
-
-
-static void	PushName(const char* name)
-{
-	if ( nameStackPtr >= MAX_NAME_STACK_DEPTH )
-		return;
-	nameStackPtr++;
-	strncpy(nameStack[nameStackPtr].name, name, sizeof(nameStack[nameStackPtr].name));
-	nameStack[nameStackPtr].name[ sizeof(nameStack[nameStackPtr].name) - 1 ]  = 0;
-}
-
-static void	PopName(void)
-{
-	if ( nameStackPtr > INVALID_STACK_DEPTH )
-		nameStackPtr--;
-}
-
-static const char*	GetName(void)
-{
-	if ( nameStackPtr <= INVALID_STACK_DEPTH )
-		return NULL;
-	return nameStack[nameStackPtr].name;
-}
-
-
-static const char*	GetUpperName(void)
-{
-	if ( nameStackPtr <= INVALID_STACK_DEPTH )
-		return NULL;
-	if ( nameStackPtr < 1 )
-		return NULL;
-
-	return nameStack[nameStackPtr - 1].name;
-}
-
-static bool	IsKnownID(uint32_t	id, unsigned int* templateIdx)
-{
-	for (unsigned int idx = 0; idx < numIDs; idx++)
-	{
-		if ( knownIDs[idx] == id )
-		{
-			if ( templateIdx != NULL )
-				*templateIdx = idx;
-			return true;
-		}
-	}
-	return false;
-}
-
-static bool	RegisterID(uint32_t	id, unsigned int* templateIdx)
-{
-	if ( numIDs >= MAX_IDS )
-		return false;
-	knownIDs[numIDs] = id;
-	templates[numIDs].shortID = id;
-	*templateIdx = numIDs;
-	numIDs++;
-	return true;
-}
-
-static void	ResetTemplates(void)
-{
-	for (size_t idx = 0; idx < numIDs; idx++)
-		ResetTemplateDescription(&templates[idx]);
-
-	numIDs = 0;
-}
-
-static void	SetState(ParseContext* ctx, XmlParseState newState)
+void	SetState(ParseContext* ctx, XmlParseState newState)
 {
 	if ( newState == ctx->state )
 		return;
 
 	if ( ctx->state == StateInAttribute )
-		PopName();
+		nameStack.PopName();
 
 	ctx->state = newState;
 }
 
-static void	UTF16ToUTF8(uint16_t w, char* buffer, size_t* bufferUsed, size_t bufferSize)
+void	UTF16ToUTF8(uint16_t w, char* buffer, size_t* bufferUsed, size_t bufferSize)
 {
 	uint32_t	charLength	=	1;
 	uint8_t		msb		=	0;
@@ -390,13 +371,13 @@ static void	UTF16ToUTF8(uint16_t w, char* buffer, size_t* bufferUsed, size_t buf
 	*bufferUsed += charLength;
 }
 
-static bool	ReadPrefixedUnicodeString(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize, bool isNullTerminated)
+bool	ReadPrefixedUnicodeString(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize, bool isNullTerminated)
 {
 	uint16_t	nameCharCnt;
 	size_t		nameBufferUsed	=	0;
 	size_t		idx		=	0;
 
-	if ( !ReadData(ctx, &nameCharCnt) )
+	if ( !ctx->ReadData(&nameCharCnt) )
 		return false;
 
 	// TODO : convert UTF-16 to UTF-8
@@ -404,7 +385,7 @@ static bool	ReadPrefixedUnicodeString(ParseContext* ctx, char* nameBuffer, size_
 	{
 		uint16_t	w;
 
-		if ( !ReadData(ctx, &w) )
+		if ( !ctx->ReadData(&w) )
 			return false;
 		UTF16ToUTF8(w, nameBuffer, &nameBufferUsed, nameBufferSize);
 	}
@@ -413,12 +394,12 @@ static bool	ReadPrefixedUnicodeString(ParseContext* ctx, char* nameBuffer, size_
 		nameBufferUsed = nameBufferSize - 1;
 	nameBuffer[nameBufferUsed] = 0;
 
-	SkipBytes(ctx, (nameCharCnt - idx + ( isNullTerminated ? 1 : 0 ))*2);
+	ctx->SkipBytes((nameCharCnt - idx + ( isNullTerminated ? 1 : 0 ))*2);
 
 	return true;
 }
 
-static bool	ReadName(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize)
+bool	ReadName(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize)
 {
 	uint16_t	nameHash;
 	uint32_t	chunkOffset;
@@ -429,7 +410,7 @@ static bool	ReadName(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize)
 	if ( nameBufferSize < 2 )
 		return false;
 	nameBuffer[0] = 0;
-	if ( !ReadData(ctx, &chunkOffset) )
+	if ( !ctx->ReadData(&chunkOffset) )
 		return false;
 	if ( ctx->offset + ctx->offsetFromChunkStart != chunkOffset )
 	{
@@ -438,9 +419,9 @@ static bool	ReadName(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize)
 		ctxPtr->offset = chunkOffset;
 	}
 
-	if ( !ReadData(ctxPtr, &d) )
+	if ( !ctxPtr->ReadData(&d) )
 		return false;
-	if ( !ReadData(ctxPtr, &nameHash) )
+	if ( !ctxPtr->ReadData(&nameHash) )
 		return false;
 	if ( !ReadPrefixedUnicodeString(ctxPtr, nameBuffer, nameBufferSize, true) )
 		return false;
@@ -448,18 +429,19 @@ static bool	ReadName(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize)
 	return true;
 }
 
-static const char*	GetProperKeyName(ParseContext* ctx)
+const char*	GetProperKeyName(ParseContext* ctx)
 {
 	const char*	key;
 	const char*	upperName;
 
-	key = GetName();
+	key = nameStack.GetName();
 
-	// printf("Key: %s Upper: %s\n", key, GetUpperName());
+	// printf("Key: %s Upper: %s\n", key, nameStack.GetUpperName());
 
-	upperName = GetUpperName();
+	upperName = nameStack.GetUpperName();
 
 	if ( ( upperName != NULL ) &&
+		( key != nullptr ) &&
 		!strcmp(key, "Data") &&
 		!strcmp(upperName, "EventData") &&
 		ctx->cachedValue[0] != 0 )
@@ -470,28 +452,30 @@ static const char*	GetProperKeyName(ParseContext* ctx)
 	return key;
 }
 
-static bool	ParseValueText(ParseContext* ctx)
+bool	ParseValueText(ParseContext* ctx)
 {
 	uint8_t		stringType;
 	char		valueBuffer[256];
 	const char*	upperName;
 	const char*	key;
 
-	if ( !ReadData(ctx, &stringType) )
+	if ( !ctx->ReadData(&stringType) )
 		return false;
 	if ( !ReadPrefixedUnicodeString(ctx, valueBuffer, sizeof(valueBuffer), false) )
 		return false;
-	// printf("******* %s=%s", GetName(), valueBuffer);
+	// printf("******* %s=%s", nameStack.GetName(), valueBuffer);
 
 	key = GetProperKeyName(ctx);
-	upperName = GetUpperName();
+	upperName = nameStack.GetUpperName();
 
 	if ( ( key != NULL ) &&
 		( ( upperName == NULL ) ||
 		strcmp(key, "Name") ||
-		strcmp(GetUpperName(), "Data") ) )
+		strcmp(upperName, "Data") ) )
 	{
-		RegisterFixedPair(ctx->currentTemplateIdx, key, valueBuffer);
+		if ( ctx->currentTemplatePtr != nullptr ) {
+			ctx->currentTemplatePtr->RegisterFixedPair(key, valueBuffer);
+		}
 	}
 
 	SetState(ctx, StateNormal);
@@ -502,7 +486,7 @@ static bool	ParseValueText(ParseContext* ctx)
 	return true;
 }
 
-static bool	ParseAttributes(ParseContext* ctx)
+bool	ParseAttributes(ParseContext* ctx)
 {
 	char		nameBuffer[256];
 
@@ -510,13 +494,13 @@ static bool	ParseAttributes(ParseContext* ctx)
 		return false;
 	// printf(" %s", nameBuffer);
 
-	PushName(nameBuffer);
+	nameStack.PushName(nameBuffer);
 	SetState(ctx, StateInAttribute);
 
 	return true;
 }
 
-static bool	ParseOpenStartElement(ParseContext* ctx, bool hasAttributes)
+bool	ParseOpenStartElement(ParseContext* ctx, bool hasAttributes)
 {
 	uint8_t		b;
 	uint16_t	w;
@@ -524,15 +508,15 @@ static bool	ParseOpenStartElement(ParseContext* ctx, bool hasAttributes)
 	uint32_t	attributeListLength	=	0;
 	char		nameBuffer[256];
 
-	if ( !ReadData(ctx, &w) )
+	if ( !ctx->ReadData(&w) )
 		return false;
-	if ( !ReadData(ctx, &elementLength) )
+	if ( !ctx->ReadData(&elementLength) )
 		return false;
 	if ( !ReadName(ctx, nameBuffer, sizeof(nameBuffer)) )
 		return false;
 	if ( hasAttributes )
 	{
-		if ( !ReadData(ctx, &attributeListLength) )
+		if ( !ctx->ReadData(&attributeListLength) )
 			return false;
 	}
 #ifdef PRINT_TAGS
@@ -540,12 +524,12 @@ static bool	ParseOpenStartElement(ParseContext* ctx, bool hasAttributes)
 	fflush(stdout);
 #endif
 
-	PushName(nameBuffer);
+	nameStack.PushName(nameBuffer);
 
 	return true;
 }
 
-static bool	ParseCloseStartElement(ParseContext* ctx)
+bool	ParseCloseStartElement(ParseContext* ctx)
 {
 	SetState(ctx, StateNormal);
 #ifdef PRINT_TAGS
@@ -555,10 +539,10 @@ static bool	ParseCloseStartElement(ParseContext* ctx)
 	return true;
 }
 
-static bool	ParseCloseElement(ParseContext* ctx)
+bool	ParseCloseElement(ParseContext* ctx)
 {
 	SetState(ctx, StateNormal);
-	PopName();
+	nameStack.PopName();
 
 #ifdef PRINT_TAGS
 	printf("</>");
@@ -567,24 +551,7 @@ static bool	ParseCloseElement(ParseContext* ctx)
 	return true;
 }
 
-static void	DumpTemplateContents(ParseContext* ctx, unsigned int templateIdx)
-{
-	return ;
-
-	printf("********************* TEMPLATE BEGIN ************************\n");
-	printf("Short ID: %08X\n", templates[templateIdx].shortID);
-	for ( TemplateFixedPair* ptr = templates[templateIdx].fixedRoot.next; ptr != NULL; ptr = ptr->next )
-	{
-		printf(" %s = %s\n", ptr->key, ptr->value);
-	}
-	for ( TemplateArgPair* ptr = templates[templateIdx].argsRoot.next; ptr != NULL; ptr = ptr->next )
-	{
-		printf(" %s { arg %04X type %04X } \n", ptr->key, ptr->argIdx, ptr->type);
-	}
-	printf("********************* TEMPLATE END   ************************\n");
-}
-
-static bool	ParseTemplateInstance(ParseContext* ctx)
+bool	ParseTemplateInstance(ParseContext* ctx)
 {
 	uint8_t		b;
 	uint32_t	numArguments;
@@ -592,20 +559,22 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 	uint32_t	tempResLen;
 	uint32_t	totalArgLen		=	0;
 
-	if ( !ReadData(ctx, &b) )
+	if ( !ctx->ReadData(&b) )
 		return false;
 	if ( b != 0x01 )
 		return false;
-	if ( !ReadData(ctx, &shortID) )
+	if ( !ctx->ReadData(&shortID) )
 		return false;
-	if ( !ReadData(ctx, &tempResLen) )
+	if ( !ctx->ReadData(&tempResLen) )
 		return false;
-	if ( !ReadData(ctx, &numArguments) )
+	if ( !ctx->ReadData(&numArguments) )
 		return false;
 
-	// printf("OK, template %08X\n", shortID);
+#if defined(PRINT_TAGS)
+	printf("OK, template %08X, num arguments %X\n", shortID, numArguments);
+#endif
 
-	if ( !IsKnownID(shortID, &ctx->currentTemplateIdx) )
+	if ( !ids.IsKnownID(shortID, &ctx->currentTemplatePtr) )
 	//if ( numArguments == 0x00000000 )
 	{
 		uint8_t		longID[16];
@@ -613,63 +582,56 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 		ParseContext	templateCtx;
 
 		/* template definition follows */
-		if ( !ReadData(ctx, &longID[0], sizeof(longID)) )
+		if ( !ctx->ReadData(&longID[0], sizeof(longID)) )
 			return false;
-		if ( !ReadData(ctx, &templateBodyLen) )
+		if ( !ctx->ReadData(&templateBodyLen) )
 			return false;
 		// printf("Template body, len %08X\n", templateBodyLen);
 
-		templateCtx.data = ctx->data + ctx->offset;
-		templateCtx.dataLen = templateBodyLen; /* mm_min ... */
-		templateCtx.offset = 0;
-		templateCtx.chunkContext = ctx;
-		templateCtx.offsetFromChunkStart = ctx->offset + ctx->offsetFromChunkStart;
-		templateCtx.cachedValue[0] = 0;
+		templateCtx.InheritWithOffset(ctx, templateBodyLen);  // this will also fix the body len if it's out of bounds
 
-		RegisterID(shortID, &templateCtx.currentTemplateIdx);
+		if ( !ids.RegisterID(shortID, &templateCtx.currentTemplatePtr) ) {
+			return false; // BAD
+		}
 
 		if ( !ParseBinXml(&templateCtx, 0) )
 			return false;
 
-		SkipBytes(ctx, templateBodyLen);
+		ctx->SkipBytes(templateBodyLen);
 
-		if ( !ReadData(ctx, &numArguments) )
+		if ( !ctx->ReadData(&numArguments) )
 			return false;
 
-		ctx->currentTemplateIdx = templateCtx.currentTemplateIdx;
-
-		DumpTemplateContents(ctx, ctx->currentTemplateIdx);
+		ctx->currentTemplatePtr = templateCtx.currentTemplatePtr;
 	}
 
 	// printf("Number of arguments: %08X\n", numArguments);
 
-	for ( TemplateFixedPair* ptr = templates[ctx->currentTemplateIdx].fixedRoot.next; ptr != NULL; ptr = ptr->next )
-	{
+	for (auto &f : ctx->currentTemplatePtr->fixed){
 		bool	alreadyPrinted	=	false;
 
-		if ( !strcmp(ptr->key, "EventID") )
+		if ( !strcmp(f.key, "EventID") )
 		{
-			uint16_t	eventID	=	strtoul(ptr->value, NULL, 10);
-			if ( ( eventID != 0 ) && ( eventDescriptionHashTable[eventID] != NULL ) )
+			uint16_t	eventID	=	strtoul(f.value, NULL, 10);
+			if ( ( eventID != 0 ) && ( eventDescriptionHashTable.find(eventID) != eventDescriptionHashTable.end() ) )
 			{
-				printf("'%s':%u (%s), ", ptr->key, eventID, eventDescriptionHashTable[eventID]);
+				printf("'%s':%u (%s), ", f.key, eventID, eventDescriptionHashTable[eventID].c_str());
 				alreadyPrinted = true;
 			}
 		}
 
 		if ( !alreadyPrinted )
-			printf("'%s':'%s', ", ptr->key, ptr->value);
+			printf("'%s':'%s', ", f.key, f.value);
 	}
 
 	// printf("\n");
 
 	size_t		argumentMapCount	=	numArguments * 2;
-	uint16_t*	argumentMap		=	(uint16_t*)malloc(sizeof(*argumentMap)*argumentMapCount);
+	std::vector<uint16_t>	argumentMap(argumentMapCount);
 
-	if ( !ReadData(ctx, argumentMap, argumentMapCount) )
+	if ( !ctx->ReadData(&argumentMap[0], argumentMapCount) )
 	{
 		printf("Failed to read the arguments\n");
-		free(argumentMap);
 		return false;
 	}
 
@@ -679,22 +641,18 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 		uint16_t		argType		=	argumentMap[argumentIdx*2 + 1];
 		TemplateArgPair*	argPair		=	NULL;
 
-	//	printf("\n %08X : [%02X %02X %02X] Arg %" PRIX64" type %08X len %08X\n",
-	//			(uint32_t)ctx->offset, ctx->data[ctx->offset], ctx->data[ctx->offset+1], ctx->data[ctx->offset+2],
-	//			argumentIdx, argType, argLen);
-		for ( TemplateArgPair* ptr = templates[ctx->currentTemplateIdx].argsRoot.next; ptr != NULL; ptr = ptr->next )
-		{
-			if ( ptr->argIdx == argumentIdx )
-			{
-				argPair = ptr;
-				break;
-			}
+		//printf("\n %08X : [%02X %02X %02X] Arg %" PRIX64" type %08X len %08X\n",
+		//		(uint32_t)ctx->offset, ctx->data[ctx->offset], ctx->data[ctx->offset+1], ctx->data[ctx->offset+2],
+		//		argumentIdx, argType, argLen);
+		auto it = ctx->currentTemplatePtr->args.find(argumentIdx);
+		if ( it != ctx->currentTemplatePtr->args.end() ) {
+			argPair = &it->second;
 		}
 
 		if ( argPair == NULL )
 		{
 			// printf("Argument not found\n");
-			SkipBytes(ctx, argLen);
+			ctx->SkipBytes(argLen);
 		}
 		else
 		{
@@ -707,7 +665,6 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 			struct tm*	t;
 			uint8_t		sid[2+6];
 			EvtxGUID	guid;
-			char*		stringBuffer;
 			size_t		stringNumUsed	=	0;
 			size_t		stringSize	=	0;
 
@@ -715,48 +672,51 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 			{
 			//// case 0x00:	/*  void */
 				//break;
-			case 0x01:	/*  String */
+			case 0x01:	/*  String */ {
 				stringSize = argLen*2+2;
-				stringBuffer = (char*)malloc(stringSize);
-				if ( stringBuffer == NULL )
-					return false;
+				std::vector<char> stringBuffer(stringSize);
 				for (size_t idx = 0; idx < argLen/2; idx++)
 				{
-					if ( !ReadData(ctx, &v_w) )
+					if ( !ctx->ReadData(&v_w) )
 						return false;
-					UTF16ToUTF8(v_w, stringBuffer, &stringNumUsed, stringSize);
+					UTF16ToUTF8(v_w, &stringBuffer[0], &stringNumUsed, stringSize);
 				}
 				if ( stringNumUsed >= stringSize )
 					stringNumUsed = stringSize - 1;
 				stringBuffer[stringNumUsed] = 0;
-				printf("'%s':'%s', ", argPair->key, stringBuffer);
-				free(stringBuffer);
+				printf("'%s':'%s', ", argPair->key, &stringBuffer[0]);
+				}
 				break;
 			case 0x04:	/*  uint8_t */
-				if ( !ReadData(ctx, &v_b) )
+				if ( !ctx->ReadData(&v_b) )
 					return false;
 				printf("'%s':%02u, ", argPair->key, v_b);
 				break;
 			case 0x06:	/*  uint16_t */
-				if ( !ReadData(ctx, &v_w) )
+				if ( !ctx->ReadData(&v_w) )
 					return false;
 
-				if ( !strcmp(argPair->key, "EventID") && ( eventDescriptionHashTable[v_w] != NULL ))
-					printf("'%s':%04u (%s), ", argPair->key, v_w, eventDescriptionHashTable[v_w]);
+				if ( !strcmp(argPair->key, "EventID") && ( eventDescriptionHashTable.find(v_w) != eventDescriptionHashTable.end()))
+					printf("'%s':%04u (%s), ", argPair->key, v_w, eventDescriptionHashTable[v_w].c_str());
 				else
 					printf("'%s':%04u, ", argPair->key, v_w);
 				break;
 			case 0x08:	/*  uint32_t */
-				if ( !ReadData(ctx, &v_d) )
+				if ( !ctx->ReadData(&v_d) )
 					return false;
 
 				if ( !strcmp(argPair->key, "LogonType") && ( v_d <= 11 ) && ( logonTypes[v_d] != NULL ))
 					printf("'%s':%08u (%s), ", argPair->key, v_d, logonTypes[v_d]);
+				else if ( !strcmp(argPair->key, "Address1") || !strcmp(argPair->key, "Address2") )
+				{
+					uint8_t*	ipPtr	=	reinterpret_cast<uint8_t*>(&v_d);
+					printf("'%s':%08u (%u.%u.%u.%u), ", argPair->key, v_d, ipPtr[0], ipPtr[1], ipPtr[2], ipPtr[3]);
+				}
 				else
 					printf("'%s':%08u, ", argPair->key, v_d);
 				break;
 			case 0x0A:	/*  uint64_t */
-				if ( !ReadData(ctx, &v_q) )
+				if ( !ctx->ReadData(&v_q) )
 					return false;
 				printf("'%s':%016" PRIu64 ", ", argPair->key, v_q);
 				break;
@@ -764,14 +724,14 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 				printf("'%s':", argPair->key);
 				for (size_t idx = 0; idx < argLen; idx++)
 				{
-					if ( !ReadData(ctx, &v_b) )
+					if ( !ctx->ReadData( &v_b) )
 						return false;
 					printf("%02X", v_b);
 				}
 				printf(", ");
 				break;
 			case 0x0F:	/* GUID */
-				if ( !ReadData(ctx, &guid) )
+				if ( !ctx->ReadData( &guid) )
 					return false;
 				printf("'%s':%08X-%02X-%02X-%02X%02X%02X%02X%02X%02X%02X%02X, ", argPair->key,
 						guid.d1, guid.w1, guid.w2,
@@ -779,18 +739,18 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 						guid.b1[4], guid.b1[5], guid.b1[6], guid.b1[7]);
 				break;
 			case 0x14:	/*  HexInt32 */
-				if ( !ReadData(ctx, &v_d) )
+				if ( !ctx->ReadData(&v_d) )
 					return false;
 				printf("'%s':%08" PRIX32", ", argPair->key, v_d);
 				break;
 
 			case 0x15:	/*  HexInt64 */
-				if ( !ReadData(ctx, &v_q) )
+				if ( !ctx->ReadData(&v_q) )
 					return false;
 				printf("'%s':%016" PRIX64 ", ", argPair->key, v_q);
 				break;
 			case 0x11:	/*  FileTime */
-				if ( !ReadData(ctx, &v_q) )
+				if ( !ctx->ReadData( &v_q) )
 					return false;
 				unixTimestamp = UnixTimeFromFileTime(v_q);
 				t = gmtime_r(&unixTimestamp, &localtm);
@@ -804,7 +764,7 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 			case 0x13:	/*  SID */
 				if ( argLen < sizeof(sid) )
 					return false;
-				if ( !ReadData(ctx, sid, sizeof(sid)) )
+				if ( !ctx->ReadData(sid, sizeof(sid)) )
 					return false;
 				v_q = 0;
 				for (size_t idx = 0; idx < 6; idx++)
@@ -815,7 +775,7 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 				printf("'%s':S-%u-%" PRIu64 "", argPair->key, sid[0], v_q);
 				for (size_t idx = sizeof(sid); idx + 4 <= argLen; idx += 4)
 				{
-					if ( !ReadData(ctx, &v_d) )
+					if ( !ctx->ReadData( &v_d) )
 						return false;
 					printf("-%u", v_d);
 				}
@@ -824,17 +784,61 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 			case 0x21:	/*  BinXml */
 				{
 					ParseContext	temporaryCtx(*ctx);
-					temporaryCtx.dataLen = temporaryCtx.offset + argLen;
+					temporaryCtx.UpdateLen(temporaryCtx.offset + argLen);
 					if ( !ParseBinXml(&temporaryCtx, 0) )
 						;//return false;
 					// printf("=====<<<<< %08X\n", argLen);
-					SkipBytes(ctx, argLen);
+					ctx->SkipBytes(argLen);
+				}
+				break;
+			case 0x81:	/*  StringArray */
+				{
+					/*  Null terminated unicode strings */
+					ParseContext	temporaryCtx(*ctx);
+					bool		inString		=	false;
+
+					temporaryCtx.UpdateLen(temporaryCtx.offset + argLen);
+
+					printf("'%s':[", argPair->key);
+
+					while ( 1 )
+					{
+						char	utf8Buffer[8];
+						size_t	utf8BufferUsed;
+
+						if ( !temporaryCtx.ReadData( &v_w) )
+							break;
+
+						if ( v_w == '\r' || v_w == '\n' )
+							v_w = ' ';
+
+						if ( v_w == 0x0000 )
+						{
+							if ( inString )
+							{
+								printf("',");
+								inString = false;
+							}
+						}
+						else
+						{
+							utf8BufferUsed = 0;
+							UTF16ToUTF8(v_w, utf8Buffer, &utf8BufferUsed, sizeof(utf8Buffer));
+							utf8Buffer[utf8BufferUsed] = 0;
+							printf("%s%s", inString ? "" : "'", utf8Buffer);
+							inString = true;
+						}
+					}
+
+					printf("%s], ", inString ? "'" : "");
+
+					ctx->SkipBytes(argLen);
 				}
 				break;
 			default:
 				if ( argType != 0x00 )
 					printf("'%s':'...//%04X[%04X]', ", argPair->key, argPair->type, argLen);
-				SkipBytes(ctx, argLen);
+				ctx->SkipBytes(argLen);
 				break;
 			}
 		}
@@ -842,64 +846,69 @@ static bool	ParseTemplateInstance(ParseContext* ctx)
 		totalArgLen += argLen;
 	}
 
-	free(argumentMap);
-
 	return true;
 }
 
 
-static bool	ParseOptionalSubstitution(ParseContext* ctx)
+bool	ParseOptionalSubstitution(ParseContext* ctx)
 {
 	uint16_t	substitutionID;
 	uint8_t		valueType;
 
-	if ( !ReadData(ctx, &substitutionID) )
+	if ( !ctx->ReadData(&substitutionID) )
 		return false;
-	if ( !ReadData(ctx, &valueType) )
+	if ( !ctx->ReadData(&valueType) )
 		return false;
 	if ( valueType == 0x00 )
 	{
-		if ( !ReadData(ctx, &valueType) )
+		if ( !ctx->ReadData(&valueType) )
 			return false;
 	}
 
-	// printf("******* %s=<<param %X/type %X>> ", GetName(), substitutionID, valueType);
-	RegisterArgPair(ctx->currentTemplateIdx, GetProperKeyName(ctx), valueType, substitutionID);
+	// printf("******* %s=<<param %X/type %X>> ", nameStack.GetName(), substitutionID, valueType);
+	if ( ctx->currentTemplatePtr != nullptr ) {
+		ctx->currentTemplatePtr->RegisterArgPair(GetProperKeyName(ctx), valueType, substitutionID);
+	}
 	SetState(ctx, StateNormal);
 
 	return true;
 }
 
-static bool	ParseBinXmlPre(const uint8_t* data, size_t dataLen, size_t inFileOffset, size_t inChunkOffset)
+bool	ParseBinXmlPre(const uint8_t* data, size_t dataLen, size_t chunkOffsetInFile, size_t inChunkOffset)
 {
 	ParseContext	ctx;
 
 	ctx.data = data;
 	ctx.dataLen = dataLen;
 	ctx.offset = inChunkOffset;
-	ctx.currentTemplateIdx = INVALID_TEMPLATE_IDX;
+	ctx.currentTemplatePtr = nullptr;
 	ctx.chunkContext = &ctx;
 	ctx.offsetFromChunkStart = 0;
 	ctx.cachedValue[0] = 0;
 
-	return ParseBinXml(&ctx, inFileOffset);
+	return ParseBinXml(&ctx, chunkOffsetInFile);
 }
 
-static bool	ParseBinXml(ParseContext* ctx, size_t inFileOffset)
-{
+bool	ParseBinXml(ParseContext* ctx, size_t chunkOffsetInFile) {
 	bool	result	=	true;
 
 	ctx->state = StateNormal;
 
-	// printf("ParseBinXml(%08X, %08X)\n", (uint32_t)ctx->offset, (uint32_t)ctx->dataLen);
+#if defined(PRINT_TAGS)
+	printf("ParseBinXml(%08X, %08X)\n", (uint32_t)ctx->offset, (uint32_t)ctx->dataLen);
+#endif
 
 	while ( result && ( ctx->offset < ctx->dataLen ) )
 	{
 		uint8_t	tag	=	ctx->data[ctx->offset++];
 
-		// printf("%08zX: %02X ", inFileOffset + ctx->offset, tag);
-		// fflush(stdout);
-		// printf("%08zX: %02X %02X %02X", inFileOffset + ctx->offset, tag, ctx->data[ctx->offset], ctx->data[ctx->offset+1]);
+#if defined(PRINT_TAGS)
+		size_t realOffset = chunkOffsetInFile + ctx->offset + ( ctx->data - ctx->chunkContext->data );
+
+		printf("%08zX: %02X ", realOffset, tag);
+		printf("%08zX: %02X %02X %02X", realOffset, tag, ctx->data[ctx->offset], ctx->data[ctx->offset+1]);
+		fflush(stdout);
+#endif
 
 		switch(tag)
 		{
@@ -948,7 +957,7 @@ static bool	ParseBinXml(ParseContext* ctx, size_t inFileOffset)
 			result = ParseOptionalSubstitution(ctx);
 			break;
 		case 0x0F: /*  FragmentHeaderToken */
-			SkipBytes(ctx, 3);
+			ctx->SkipBytes( 3);
 			break;
 
 		default:
@@ -956,17 +965,18 @@ static bool	ParseBinXml(ParseContext* ctx, size_t inFileOffset)
 			break;
 		}
 
-		// printf("\n");
+#if defined(PRINT_TAGS)
+		printf("\n");
+#endif
 	}
 
 	return result;
 }
 
-static bool	ParseEVTXInt(int f)
-{
+bool	ParseEVTXInt(int f) {
 	EvtxHeader	header;
 	uint64_t	off	=	0;
-	uint8_t*	chunk;
+	std::vector<uint8_t> chunk(EVTX_CHUNK_SIZE);
 	bool		result	=	true;
 
 	if ( read(f, &header, sizeof(header)) != sizeof(header) )
@@ -980,23 +990,19 @@ static bool	ParseEVTXInt(int f)
 
 	off = sizeof(header);
 
-	chunk = (uint8_t*)malloc(EVTX_CHUNK_SIZE);
-	if ( chunk == NULL )
-		return false;
-
 	while ( result )
 	{
-		EvtxChunkHeader*	chunkHeader	=	(EvtxChunkHeader*)chunk;
-		uint64_t		inRecordOff;
+		EvtxChunkHeader*	chunkHeader	=	reinterpret_cast<EvtxChunkHeader*>(&chunk[0]);
 
 		ResetTemplates();
+		nameStack.Reset();
 
 		if ( lseek(f, off, SEEK_SET) != off )
 		{
 			result = false;
 			break;
 		}
-		if ( read(f, chunk, EVTX_CHUNK_SIZE) != EVTX_CHUNK_SIZE )
+		if ( read(f, &chunk[0], chunk.size()) != chunk.size() )
 			break;
 
 		if ( memcmp(chunkHeader->magic, EVTX_CHUNK_HEADER_MAGIC, sizeof(EVTX_CHUNK_HEADER_MAGIC)) )
@@ -1007,16 +1013,16 @@ static bool	ParseEVTXInt(int f)
 
 		// printf("Chunk %" PRIu64 " .. %" PRIu64 "\n", chunkHeader->firstRecordNumber, chunkHeader->lastRecordNumber);
 
-		inRecordOff = sizeof(*chunkHeader);
+		uint64_t inRecordOff = sizeof(*chunkHeader);
 
 		while ( result )
 		{
-			EvtxRecordHeader*	recordHeader	=	(EvtxRecordHeader*)(chunk + inRecordOff);
+			EvtxRecordHeader*	recordHeader	=	reinterpret_cast<EvtxRecordHeader*>(&chunk[inRecordOff]);
 			time_t			unixTimestamp;
 			struct tm		localtm;
 			struct tm*		t;
 
-			if ( inRecordOff + sizeof(*recordHeader) > EVTX_CHUNK_SIZE )
+			if ( inRecordOff + sizeof(*recordHeader) > chunk.size() )
 				break;
 
 			if ( recordHeader->magic != 0x00002a2a )
@@ -1036,11 +1042,11 @@ static bool	ParseEVTXInt(int f)
 			}
 
 			// printf("%" PRIX64 ": Record %" PRIu64 " %04u.%02u.%02u-%02u:%02u:%02u ", inRecordOff, recordHeader->number, t->tm_year+1900, t->tm_mon+1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
-			printf("Record #%" PRIu64 " %04u.%02u.%02u-%02u:%02u:%02u ", recordHeader->number, t->tm_year+1900, t->tm_mon+1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
+			printf("Record #%" PRIu64 " %04u-%02u-%02uT%02u:%02u:%02uZ ", recordHeader->number, t->tm_year+1900, t->tm_mon+1, t->tm_mday, t->tm_hour, t->tm_min, t->tm_sec);
 
-			if ( !ParseBinXmlPre(chunk,
-						EVTX_CHUNK_SIZE,
-						off + inRecordOff + sizeof(*recordHeader),
+			if ( !ParseBinXmlPre(&chunk[0],
+						chunk.size(),
+						off,
 						inRecordOff + sizeof(*recordHeader) ) )
 			{
 				if ( recordHeader->number >= chunkHeader->firstRecordNumber &&
@@ -1055,7 +1061,7 @@ static bool	ParseEVTXInt(int f)
 			inRecordOff += recordHeader->size;
 		}
 
-		off += EVTX_CHUNK_SIZE;
+		off += chunk.size();
 
 		if ( inRecordOff > off )
 		{
@@ -1067,8 +1073,7 @@ static bool	ParseEVTXInt(int f)
 	return result;
 }
 
-static bool	ParseEVTX(const char* fileName)
-{
+bool	ParseEVTX(const char* fileName) {
 	bool	result;
 	int	f	=	open(fileName, O_RDONLY|O_BINARY);
 	if ( f < 0 )
@@ -1081,8 +1086,7 @@ static bool	ParseEVTX(const char* fileName)
 	return result;
 }
 
-static void InitEventDescriptions(void)
-{
+void InitEventDescriptions(void) {
 	for (size_t idx = 0; idx < sizeof(eventDescriptions)/sizeof(eventDescriptions[0]); idx++)
 	{
 		char*		nptr	=	NULL;
@@ -1100,7 +1104,7 @@ static void InitEventDescriptions(void)
 
 #ifdef _WIN32
 
-#ifndef __MINGW64_VERSION_MAJOR
+#if !defined(__MINGW64_VERSION_MAJOR) && !defined(_MSC_VER)
 
 extern "C"
 {
@@ -1117,9 +1121,9 @@ BOOL (WINAPI * Wow64RevertWow64FsRedirection)(
 
 #endif
 
+}
 
-int main(int argc, char* argv[])
-{
+int main(int argc, char* argv[]) {
 	void*	redir;
 
 #ifdef _WIN32
@@ -1127,13 +1131,10 @@ int main(int argc, char* argv[])
 		Wow64DisableWow64FsRedirection(&redir);
 #endif
 
-	eventDescriptionHashTable = (const char**)malloc(sizeof(const char*) * 65536 );
-	memset(eventDescriptionHashTable, 0, sizeof(const char*)*65536);
-	InitTemplates();
 	InitEventDescriptions();
-	for (int idx = 1; idx < argc; idx++)
+	for (int idx = 1; idx < argc; idx++) {
 		ParseEVTX(argv[idx]);
-	free(eventDescriptionHashTable);
+	}
 
 #ifdef _WIN32
 	if (Wow64RevertWow64FsRedirection != NULL)
