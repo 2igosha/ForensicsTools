@@ -15,7 +15,7 @@
 #include <inttypes.h>
 #include <string.h>
 #include <time.h>
-#include <utils/win_types.h>
+#include "win_types.h"
 #include <unordered_map>
 #include <vector>
 #include <map>
@@ -24,7 +24,7 @@
 
 // #define PRINT_TAGS
 
-#include <tools/wintime.h>
+#include "wintime.h"
 
 namespace {
 
@@ -94,27 +94,27 @@ struct TemplateDescription;
 struct ParseContext {
 	ParseContext*	chunkContext;
 	const uint8_t*	data;
-	size_t		dataLen;
-	size_t		offset;
-	size_t		offsetFromChunkStart;
+	uint64_t    dataLen;
+	uint64_t    offset;
+	uint64_t    offsetFromChunkStart;
 	XmlParseState	state;
 	TemplateDescription* currentTemplatePtr;
 	char		cachedValue[256];
 
-	bool	HaveEnoughData(size_t numBytes) const {
+	bool	HaveEnoughData(uint64_t numBytes) const {
 		return ( offset + numBytes <= dataLen );
 	}
 
-	void	SkipBytes(size_t numBytes) {
+	void	SkipBytes(uint64_t numBytes) {
 		offset += numBytes;
 	}
 
 	template<class c>
-	bool	ReadData(c* result, size_t count = 1)
+	bool	ReadData(c* result, uint64_t count = 1)
 	{
 		if ( !HaveEnoughData(sizeof(*result) * count) )
 			return false;
-		for (size_t idx = 0; idx < count; idx++)
+		for (uint64_t idx = 0; idx < count; idx++)
 		{
 			result[idx] = *(c*)(data + offset);
 			offset += sizeof(*result);
@@ -122,7 +122,7 @@ struct ParseContext {
 		return true;
 	}
 
-	void InheritWithOffset(ParseContext* other, size_t wantedLen) {
+	void InheritWithOffset(ParseContext* other, uint64_t wantedLen) {
 		data = other->data + other->offset;
 		dataLen = wantedLen;
 		if ( other->offset + dataLen > other->dataLen ) {
@@ -142,14 +142,14 @@ struct ParseContext {
 		cachedValue[0] = 0;
 	}
 
-	void UpdateLen(size_t wantedLen){
+	void UpdateLen(uint64_t wantedLen){
 		if ( wantedLen <= dataLen ) {
 			dataLen = wantedLen;
 		}
 	}
 };
 
-bool	ParseBinXml(ParseContext* ctx, size_t chunkOffsetInFile);
+bool	ParseBinXml(ParseContext* ctx, uint64_t chunkOffsetInFile);
 
 struct TemplateArgPair {
 	TemplateArgPair(const TemplateArgPair&) = delete;
@@ -316,7 +316,7 @@ void	SetState(ParseContext* ctx, XmlParseState newState)
 	ctx->state = newState;
 }
 
-void	UTF16ToUTF8(uint16_t w, char* buffer, size_t* bufferUsed, size_t bufferSize)
+void	UTF16ToUTF8(uint16_t w, char* buffer, uint64_t* bufferUsed, uint64_t bufferSize)
 {
 	uint32_t	charLength	=	1;
 	uint8_t		msb		=	0;
@@ -371,11 +371,11 @@ void	UTF16ToUTF8(uint16_t w, char* buffer, size_t* bufferUsed, size_t bufferSize
 	*bufferUsed += charLength;
 }
 
-bool	ReadPrefixedUnicodeString(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize, bool isNullTerminated)
+bool	ReadPrefixedUnicodeString(ParseContext* ctx, char* nameBuffer, uint64_t nameBufferSize, bool isNullTerminated)
 {
 	uint16_t	nameCharCnt;
-	size_t		nameBufferUsed	=	0;
-	size_t		idx		=	0;
+	uint64_t nameBufferUsed	=	0;
+	uint64_t idx		=	0;
 
 	if ( !ctx->ReadData(&nameCharCnt) )
 		return false;
@@ -399,7 +399,7 @@ bool	ReadPrefixedUnicodeString(ParseContext* ctx, char* nameBuffer, size_t nameB
 	return true;
 }
 
-bool	ReadName(ParseContext* ctx, char* nameBuffer, size_t nameBufferSize)
+bool	ReadName(ParseContext* ctx, char* nameBuffer, uint64_t nameBufferSize)
 {
 	uint16_t	nameHash;
 	uint32_t	chunkOffset;
@@ -626,7 +626,7 @@ bool	ParseTemplateInstance(ParseContext* ctx)
 
 	// printf("\n");
 
-	size_t		argumentMapCount	=	numArguments * 2;
+	uint64_t argumentMapCount	=	numArguments * 2;
 	std::vector<uint16_t>	argumentMap(argumentMapCount);
 
 	if ( !ctx->ReadData(&argumentMap[0], argumentMapCount) )
@@ -665,8 +665,8 @@ bool	ParseTemplateInstance(ParseContext* ctx)
 			struct tm*	t;
 			uint8_t		sid[2+6];
 			EvtxGUID	guid;
-			size_t		stringNumUsed	=	0;
-			size_t		stringSize	=	0;
+			uint64_t stringNumUsed	=	0;
+			uint64_t stringSize	=	0;
 
 			switch(argType)
 			{
@@ -675,7 +675,7 @@ bool	ParseTemplateInstance(ParseContext* ctx)
 			case 0x01:	/*  String */ {
 				stringSize = argLen*2+2;
 				std::vector<char> stringBuffer(stringSize);
-				for (size_t idx = 0; idx < argLen/2; idx++)
+				for (uint64_t idx = 0; idx < argLen/2; idx++)
 				{
 					if ( !ctx->ReadData(&v_w) )
 						return false;
@@ -722,7 +722,7 @@ bool	ParseTemplateInstance(ParseContext* ctx)
 				break;
 			case 0x0E:	/*  binary */
 				printf("'%s':", argPair->key);
-				for (size_t idx = 0; idx < argLen; idx++)
+				for (uint64_t idx = 0; idx < argLen; idx++)
 				{
 					if ( !ctx->ReadData( &v_b) )
 						return false;
@@ -767,13 +767,13 @@ bool	ParseTemplateInstance(ParseContext* ctx)
 				if ( !ctx->ReadData(sid, sizeof(sid)) )
 					return false;
 				v_q = 0;
-				for (size_t idx = 0; idx < 6; idx++)
+				for (uint64_t idx = 0; idx < 6; idx++)
 				{
 					v_q <<= 8;
 					v_q |= sid[2+idx];
 				}
 				printf("'%s':S-%u-%" PRIu64 "", argPair->key, sid[0], v_q);
-				for (size_t idx = sizeof(sid); idx + 4 <= argLen; idx += 4)
+				for (uint64_t idx = sizeof(sid); idx + 4 <= argLen; idx += 4)
 				{
 					if ( !ctx->ReadData( &v_d) )
 						return false;
@@ -804,7 +804,7 @@ bool	ParseTemplateInstance(ParseContext* ctx)
 					while ( 1 )
 					{
 						char	utf8Buffer[8];
-						size_t	utf8BufferUsed;
+						uint64_t utf8BufferUsed;
 
 						if ( !temporaryCtx.ReadData( &v_w) )
 							break;
@@ -874,7 +874,7 @@ bool	ParseOptionalSubstitution(ParseContext* ctx)
 	return true;
 }
 
-bool	ParseBinXmlPre(const uint8_t* data, size_t dataLen, size_t chunkOffsetInFile, size_t inChunkOffset)
+bool	ParseBinXmlPre(const uint8_t* data, uint64_t dataLen, uint64_t chunkOffsetInFile, uint64_t inChunkOffset)
 {
 	ParseContext	ctx;
 
@@ -889,7 +889,7 @@ bool	ParseBinXmlPre(const uint8_t* data, size_t dataLen, size_t chunkOffsetInFil
 	return ParseBinXml(&ctx, chunkOffsetInFile);
 }
 
-bool	ParseBinXml(ParseContext* ctx, size_t chunkOffsetInFile) {
+bool	ParseBinXml(ParseContext* ctx, uint64_t chunkOffsetInFile) {
 	bool	result	=	true;
 
 	ctx->state = StateNormal;
@@ -903,7 +903,7 @@ bool	ParseBinXml(ParseContext* ctx, size_t chunkOffsetInFile) {
 		uint8_t	tag	=	ctx->data[ctx->offset++];
 
 #if defined(PRINT_TAGS)
-		size_t realOffset = chunkOffsetInFile + ctx->offset + ( ctx->data - ctx->chunkContext->data );
+		uint64_t realOffset = chunkOffsetInFile + ctx->offset + ( ctx->data - ctx->chunkContext->data );
 
 		printf("%08zX: %02X ", realOffset, tag);
 		printf("%08zX: %02X %02X %02X", realOffset, tag, ctx->data[ctx->offset], ctx->data[ctx->offset+1]);
@@ -981,7 +981,7 @@ bool	ParseEVTXInt(int f) {
 
 	if ( read(f, &header, sizeof(header)) != sizeof(header) )
 		return false;
-	if ( header.version != 0x00030001)
+	if ( header.version != 0x00030001 && header.version != 0x00030002)
 		return false;
 
 #ifdef PRINT_TAGS
@@ -997,7 +997,10 @@ bool	ParseEVTXInt(int f) {
 		ResetTemplates();
 		nameStack.Reset();
 
-		if ( lseek(f, off, SEEK_SET) != off )
+#ifdef _WIN32
+#define lseek64 _lseeki64
+#endif
+		if ( lseek64(f, off, SEEK_SET) != off )
 		{
 			result = false;
 			break;

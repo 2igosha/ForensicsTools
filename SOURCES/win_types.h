@@ -58,8 +58,6 @@ typedef uint32_t in_addr_t;
 
 #define sleep(x) Sleep(x*1000)
 
-#include "getopt.h"
-
 #if defined (_MSC_VER)
 
 typedef SSIZE_T ssize_t;
