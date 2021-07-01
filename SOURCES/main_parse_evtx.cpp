@@ -687,6 +687,19 @@ bool	ParseTemplateInstance(ParseContext* ctx)
 				printf("'%s':'%s', ", argPair->key, &stringBuffer[0]);
 				}
 				break;
+            case 0x02:  /*  AnsiStringType  */ {
+				stringSize = argLen+1;
+				std::vector<char> stringBuffer(stringSize);
+				for (uint64_t idx = 0; idx < argLen; idx++)
+				{
+					if ( !ctx->ReadData(&v_b) )
+						return false;
+                    stringBuffer[idx] = v_b;
+				}
+				stringBuffer[argLen] = 0;
+				printf("'%s':'%s', ", argPair->key, &stringBuffer[0]);
+				}
+				break;
 			case 0x04:	/*  uint8_t */
 				if ( !ctx->ReadData(&v_b) )
 					return false;
@@ -999,6 +1012,10 @@ bool	ParseEVTXInt(int f) {
 
 #ifdef _WIN32
 #define lseek64 _lseeki64
+#endif
+#ifdef __MACH__
+        static_assert(sizeof(off_t) == 8, "Unsupported lseek() implementation on Mach");
+        #define lseek64 lseek
 #endif
 		if ( lseek64(f, off, SEEK_SET) != off )
 		{
